@@ -8,3 +8,8 @@ f=''; srv = net.createServer(net.TCP); srv:listen(2000, function(c)print(node.he
 file.open('hmm.lua', 'w'); file.write(f); file.close(); srv:close();
 dofile('hmm.lua')
 
+ip = "192.168.1.20"; filename = "foo.bar";  buf = ''; 
+sk = net.createConnection(net.TCP, 0); 
+sk:on("receive", function(sck, c) buf = buf .. c; end );
+sk:on("disconnection", function(sock, a) file.open(filename, "w"); file.write(buf); file.close(); end);  
+sk:connect(9600, ip);

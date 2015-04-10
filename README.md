@@ -19,9 +19,8 @@ The init shim then opens a telnet server for 10 seconds. If no connections are m
 closes the server and runs `main.lua`. If there is no such file, it keeps the telnet
 server open.
 
-The host program can "upload" files to the device by acting as a TFTP (or similar protocol)
-server. It telnets to the device and issues a get command
-
+The host program can "upload" files to the device by acting as a simple TCP server. It
+opens a socket that will just output the desired contents. 
 ### TODO:
 python program to
 - set wifi settings

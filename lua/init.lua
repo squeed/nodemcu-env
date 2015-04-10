@@ -1,6 +1,9 @@
 -- NodeMCU initialization environment
 -- This will open a telnet server for 25 seconds, then run
 -- main.lua on timeout
+--
+-- Author: Casey D Callendrello, 2015
+-- Licenced under the Eclipse Public License, https://www.eclipse.org/legal/epl-v10.html
 
 -- The telnet server
 _telnetSocket = nil
@@ -11,14 +14,15 @@ tmr.alarm(0, 2500, 0, _checkwifi)
 
 function _checkwifi()
 	print("Are we alive?")
-	status = wifi.sta.status()
+	local status = wifi.sta.status()
 	print(status)
 	if (status == 5) then
 		print ("Wifi is alive!")
+		print (wifi.sta.getip())
 		-- Once wifi is alive, proceed with booting
 		bcast()
 		_startRunTimer()
-		telnetServer(true)
+		telnetServer()
 	else
 		print("Wifi not alive " .. status)
 		tmr.alarm(0, 2500, 0, _checkwifi)
@@ -27,13 +31,12 @@ end
 
 -- Send a broadcast UDP Packet to port 5050 for discovery
 function bcast()
-	bcip = wifi.sta.getbroadcast()
+	local bcip = wifi.sta.getbroadcast()
 	print("Sending broadcast ping")
-	print("Broadcast address: " .. bcip)
-	conn = net.createConnection(net.UDP, 0)
+	local conn = net.createConnection(net.UDP, 0)
 	conn:connect(5050, bcip)
-	ip, nm = wifi.sta.getip()
-	sendstr = ip .. " " .. node.chipid() .. " " .. node.flashid() .. "\n"
+	local ip, nm = wifi.sta.getip()
+	local sendstr = ip .. " " .. node.chipid() .. " " .. node.flashid() .. "\n"
 	conn:send("HELO 0 " .. sendstr, function(cb) print("sent!"); end)
 end
 
@@ -56,7 +59,7 @@ end
 
 -- Open a "telnet" server on port 2323
 function telnetServer()
-	print("Starting telnet server")
+	print("Starting telnet server on port 2323")
 	_telnetSocket = net.createServer(net.TCP,180)
 	_telnetSocket:listen(2323,function(c) 
 		function s_output(str) 
@@ -81,17 +84,13 @@ end
 
 function run()
 	print("Done with pre-boot...")
-	exists = file.open("main.lua")
+	local exists = file.open("main.lua")
 	file.close()
 	if exists then
 		print("Running main.lua")
 		dofile("main.lua")
-	else if _telnetSocket == nil then
+	elseif _telnetSocket == nil then
 		print("Telnet time!")
 		telnetServer(false)
 	end
 end
-
-
-
-

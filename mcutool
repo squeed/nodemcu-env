@@ -1,0 +1,249 @@
+#!/usr/bin/env python -t
+
+
+# This is a silly little tool for chatting with NodeMCU.
+
+import argparse
+import serial
+import socket
+import socketserver
+import time
+import threading
+
+DEBUG = True
+
+BAUDRATE = 9600
+DEFAULT_PORT = 9600  # lol why not
+BROADCAST_PORT = 5050
+
+class SerialConn:
+    # TODO: timeouts
+    def __init__(self, port):
+        self.port = serial.Serial(port, BAUDRATE)
+
+        if DEBUG:
+            print("Flusing serial port")
+        self.write(b'\r\n')  # flush whatever state the repl is in
+
+        self.port.timeout = 2
+        print(self.port.read(100))
+
+        self.port.timeout = 10
+
+    def write(self, buf):
+        if DEBUG:
+            print("WRITE COMMAND: " + str(buf))
+        self.port.write(buf)
+
+    def read(self, length):
+        return self.port.read(length)
+
+    def readuntil(self, delim=b"\r\n> "):
+        """ Read until a delimiter is seen"""
+        buf = self.read(1)
+        while not buf.endswith(delim):
+            buf += self.read(1)
+        print(buf)
+        return buf
+
+    def do_command(self, command):
+        self.write(command + b"\r\n")
+        response = self.readuntil()
+        if DEBUG:
+            print ("Got response: " + response.decode('ascii'))
+        responses = response.split(b'\r\n')
+
+        # The first response is the command we sent, the last response is
+        # the newline, so if there is a middle one then return that
+        if len(responses) > 2:
+            return responses[1:-1]
+
+
+class FileServer:
+    def __init__(self, filepath, port=DEFAULT_PORT):
+        self.filepath = filepath
+        self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.bind(('0.0.0.0', port))
+        self.socket.listen(1)
+
+    def serve(self):
+        self.thread = threading.Thread(target=self._serve, daemon=False)
+        self.thread.start()
+
+    def stop(self):
+        self.socket.close()
+
+    def _serve(self):
+        """ Called by thread"""
+        conn, addr = self.socket.accept()
+        print("Got connection, serving file")
+
+        # be lazy, read the whole file in to memory
+        contents = open(self.filepath, 'rb').read()
+        conn.sendall(contents)
+        conn.close()
+        print("File sent")
+        self.stop()
+
+
+class BroadcastListener(socketserver.BaseRequestHandler):
+    """
+    Listen for UDP broadcasts from the booted ESP
+    """
+    def handle(self):
+        data = self.request[0].strip()
+        ip = self.client_address[0]
+        print("Got a ping from {}: [{}]!".format(ip, data))
+
+
+def main():
+    args = parse_args()
+    command = args.op
+    if command == 'wifi':
+        setup_wifi(args.port[0],
+                   args.network_password[0], args.network_password[1])
+
+    elif command == 'bootstrap':
+        bootstrap(args.port[0])
+
+    elif command == 'watch':
+        watch()
+
+def setup_wifi(port, ssid, password):
+    """Issue the serial commands to set up wifi"""
+
+    sp = SerialConn(port)
+
+    print("Configuring WiFi settings via serial...")
+
+    sp.do_command(b'wifi.setmode(wifi.STATION)')
+
+    wifi_cmd = b'wifi.sta.config("' + escape_lua(bytes(ssid, 'ascii')) + b'", "'\
+               + escape_lua(bytes(password, 'ascii')) + b'")'
+    sp.do_command(wifi_cmd)
+    time.sleep(10)
+    resp = sp.do_command(b'print(wifi.sta.getip())')
+    resp = resp[0]
+    resp = resp.split(b'\t')
+    print("Successfully got IP address " + resp[0].decode('ascii'))
+    print("Now load the boostrap environment with 'boostrap'")
+
+
+def bootstrap(port):
+    """ Load the initial lua file over the serial port """
+    sp = SerialConn(port)
+
+    print("Removing any old files")
+    res = sp.do_command(b'file.format(); ' +
+                        b'print("OK")')
+
+    if res[-1] != b'OK':
+        print("Command failed!")
+        return False
+
+    # Start the fileserver
+    serve_file('lua/init-tiny.lua')
+
+    ip = socket.gethostbyname(socket.gethostname())
+    res = sp.do_command(bytes(
+        'ip="{}"; filename="init.lua"; print("OK")'.format(ip), 'ascii'))
+    if res[0] != b'OK':
+        print("Command failed!")
+        return False
+
+    bootstrap_cmd = b'sk = net.createConnection(net.TCP, 0); ' + \
+        b'file.open(filename, "w+"); ' + \
+        b'sk:on("receive", function(sck, c) file.write(c) ; end ); ' + \
+        b'sk:on("disconnection", function(sock, a) file.flush(); file.close(); end); ' + \
+        b'sk:connect(' + bytes(str(DEFAULT_PORT), 'ascii') + b', ip); ' + \
+        b'print("OK")'
+
+    res = sp.do_command(bootstrap_cmd)
+    if res[0] != b'OK':
+        print("Command failed!")
+        return False
+
+    time.sleep(4)
+
+    res = sp.do_command(b'node.compile("init.lua"); print("OK")')
+    if res[0] != b'OK':
+        print("Compiling init.lua failed, bad!")
+        sp.do_command(b'file.remove("init.lua")')
+        return False
+
+    res = sp.do_command(b'print(node.chipid())')
+    chipid = res[0]
+    print ("Bootstrap of chip {} successful! ".format(chipid) +
+           "Run mcutool shell, then reboot module, to connect")
+    return True
+
+
+def serve_file(path):
+    """ Open a socket that will serve a file """
+    fs = FileServer(path)
+    fs.serve()
+
+
+def send_file():
+    """ Wait for a booting ESP to connect, then drop in to a shell """
+    server = socketserver.UDPServer(('0.0.0.0', BROADCAST_PORT),
+                                    BroadcastListener)
+    server.serve_forever()
+
+
+def escape_lua(instr):
+    """ Turn an arbitrary string in to a valid Lua string literal by
+    escaping as necessary """
+
+    instr = instr.replace(b'\\', b'\\\\')
+    instr = instr.replace(b"'", b"\\'")
+    instr = instr.replace(b'"', b'\\"')
+    instr = instr.replace(b"[", b"\\[")
+    instr = instr.replace(b"]", b"\\]")
+    return instr
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Make NodeMCU a little kinder")
+
+    subparsers = parser.add_subparsers(
+        dest='op')
+
+    parser_wifi = subparsers.add_parser(
+        'wifi', help="Connect to a wifi network")
+
+    parser_wifi.add_argument('--port', '-p', nargs=1,
+                             help="serial port", required=True)
+
+    parser_wifi.add_argument('network_password', nargs='+',
+                             help='network name and password',
+                             metavar="SSID PASSWORD")
+
+    parser_boot = subparsers.add_parser(
+        'bootstrap', help="Upload init.lua file")
+
+    parser_boot.add_argument('--port', '-p', nargs=1,
+                             help="serial port", required=True)
+
+    subparsers.add_parser(
+        'watch', help="Watch for boards to boot up, and print their info")
+
+    parser_send = subparsers.add_parser(
+        'send', help="Send a file to a given target. If no target is " +
+        "specified, send it to the next board that boots")
+
+    parser_send.add_argument('--ip', nargs=1,
+                             help="The IP to connect to")
+
+    parser_send.add_argument('--chip-id', nargs=1, metavar="CHIPID",
+                             help="Wait for CHIPID to send a broadcast, then " +
+                             "connect to that")
+
+    args = parser.parse_args()
+
+    return args
+
+
+if __name__ == '__main__':
+    main()
