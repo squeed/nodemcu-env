@@ -3,9 +3,10 @@ This is a small set of programs to improve interacting with ESP8266-based device
 NodeMCU firmware.
 
 It currently provides
+
 1. Bootstrapping
-2. Device discovery
-3. On-network file uploading
+1. Device discovery
+1. On-network file uploading
 
 ## Components
 There is a small `init.lua` module that intercepts boot. It sends a broadcast packet for discovery,
