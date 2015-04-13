@@ -1,65 +1,17 @@
--- NodeMCU initialization environment
--- This will open a telnet server for 25 seconds, then run
--- main.lua on timeout
---
--- Author: Casey D Callendrello, 2015
--- Licenced under the Eclipse Public License, https://www.eclipse.org/legal/epl-v10.html
-
--- The telnet server
-_telnetSocket = nil
-inboot = true
-
--- Start wifi init timer
-tmr.alarm(0, 2500, 0, _checkwifi)
-
-function _checkwifi()
-	print("Are we alive?")
-	local status = wifi.sta.status()
-	print(status)
-	if (status == 5) then
-		print ("Wifi is alive!")
-		print (wifi.sta.getip())
-		-- Once wifi is alive, proceed with booting
-		bcast()
-		_startRunTimer()
+-- init environment, minified
+function _w()
+	if (wifi.sta.status() == 5) then
+		local conn = net.createConnection(net.UDP, 0)
+		conn:connect(5050, wifi.sta.getbroadcast())
+		conn:send("PING! " .. wifi.sta.getip() .. " " .. node.chipid() .. "\n",
+		function(cb) conn:close(); end)
+		tmr.alarm(1, 15000, run)
 		telnetServer()
-	else
-		print("Wifi not alive " .. status)
-		tmr.alarm(0, 2500, 0, _checkwifi)
+	else tmr.alarm(0, 2500, 0, _w)
 	end
 end
-
--- Send a broadcast UDP Packet to port 5050 for discovery
-function bcast()
-	local bcip = wifi.sta.getbroadcast()
-	print("Sending broadcast ping")
-	local conn = net.createConnection(net.UDP, 0)
-	conn:connect(5050, bcip)
-	local ip, nm = wifi.sta.getip()
-	local sendstr = ip .. " " .. node.chipid() .. " " .. node.flashid() .. "\n"
-	conn:send("HELO 0 " .. sendstr, function(cb) print("sent!"); end)
-end
-
--- Start the 25 second countdown to "normal" boot
-function _startRunTimer()
-	tmr.alarm(1, 25000, 0, function()
-		_telnetSocket:close()
-		_telnetSocket = nil
-		run()
-	end)
-end
-
--- Stop the 25 second countdown
-function _stopRunTimer()
-	if inboot then
-		tmr.stop(1)
-		inboot = false
-	end
-end
-
--- Open a "telnet" server on port 2323
 function telnetServer()
-	print("Starting telnet server on port 2323")
+	print(wifi.sta.getip())
 	_telnetSocket = net.createServer(net.TCP,180)
 	_telnetSocket:listen(2323,function(c) 
 		function s_output(str) 
@@ -67,30 +19,31 @@ function telnetServer()
 				then c:send(str) 
 			end 
 		end 
-		node.output(s_output, 0)   -- re-direct output to function s_ouput.
-		c:on("connection", function(c)
-			_stopRunTimer() -- Stop the run timer so we don't go to main.lua
-		end)
-		c:on("receive",function(c,l) 
-			node.input(l)
-		end)
-		c:on("disconnection",function(c)
-			node.output(nil)
-			print("Telnet disconnect")
-		end) 
+		node.output(s_output, 0)
+		c:on("connection", function(c) tmr.stop(1); end)
+		c:on("receive",function(c,l) node.input(l); end)
+		c:on("disconnection",function(c) node.output(nil); end)
 		print("connected")
 	end)
 end
-
 function run()
-	print("Done with pre-boot...")
-	local exists = file.open("main.lua")
-	file.close()
+	local exists = false
+	for k,v in pairs(file.list()) do
+		if k == 'main.lua' then exists = true end
+	end
 	if exists then
-		print("Running main.lua")
-		dofile("main.lua")
-	elseif _telnetSocket == nil then
-		print("Telnet time!")
-		telnetServer(false)
+		print("running main.lua")
+		_telnetSocket:close()
+		_telnetSocket = nil
+		dofile('main.lua')
 	end
 end
+function getfile(ip, name)
+	file.open(name, "w+")
+	local sk = net.createConnection(net.TCP, 0)
+	sk:on("receive", function(sck, c) file.write(c); end)
+	sk:on("disconnection", function(sck, a) file.flush(); file.close(); end)
+	sk:connect(9600, ip);
+end
+tmr.alarm(0, 2500, 0, _w)
+print("mcutool shim version 0.5.0")

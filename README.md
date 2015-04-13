@@ -1,48 +1,45 @@
 # MCU-Env - an environment for the NodeMCU
-This is a small project to produce a simple environment and library for the NodeMCU firmware
-for the ESP8266. It tries to solve these problems:
+This is a small set of programs to improve interacting with ESP8266-based devices running the
+NodeMCU firmware.
 
-* Device discovery
-* File loading
-* Bootstrap control
+It currently provides
+1. Bootstrapping
+2. Device discovery
+3. On-network file uploading
 
-It has two parts: a python script for control on the host side, and a lua environment
-to run on the Node side
+## Components
+There is a small `init.lua` module that intercepts boot. It sends a broadcast packet for discovery,
+then opens a telnet server on port 2323 for 25 seconds. Then, it proceeds with normal boot. It boots
+to `main.lua`.
 
+The utility program, `mcutool`, provides a simple client program for interacting with this firmware.
+It can also bootstrap fresh ESP devices over serial.
 
-## Structure
-The `init.lua` program grabs the boot process and waits for wifi. Once connected,
-it sends a UDP broadcast ping to be discovered. A host program, with an open socket,
-can detect this ping.
+# Using
 
-The init shim then opens a telnet server for 10 seconds. If no connections are made, it
-closes the server and runs `main.lua`. If there is no such file, it keeps the telnet
-server open.
+## Quickstart
 
-The host program can "upload" files to the device by acting as a simple TCP server. It
-opens a socket that will just output the desired contents. 
-### TODO:
-python program to
-- set wifi settings
-- shove up bootstrapping
-- send files
-
-lua:
-- TFTP client
+```
+mcutool wifi --port /dev/tty.usbserial SSID PASSWORD
+mcutool bootstrap --port /dev/tty.usbserial
+mcutool watch
+# Reboot your ESP now, watch for IP
+mcutool send --ip <IP> lua/blink.lua main.lua #yay blinking lights
+```
 
 
+## Modes
+### wifi
+A simple convenience method - set the SSID and password over serial. Fortunately
+these settings are persistent across reboots
 
-### Incomprehensible notes.
-These notes are for my own record
+### bootstrap
+Send the `init.lua` file up via serial. **This formats all files on the chip!**
 
-After a time, load main.lua
+### send
+Upload a file to a system. If no target is specified, it will upload to the next
+ESP that boots. If given a chip ID, it will wait for that unit to broadcast. If
+given an IP, it will connect directly.
 
-commands:
-norun - don't run main.lua
-run - shut down server, run main.lua
-
-putfile <name> <addr> - have it get a file
-exec <line> - run the line
-
-probably just write functions instead of anything complicated
-
+### watch
+Print the IP and Chip IDs of every ESP that boots.

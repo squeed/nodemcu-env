@@ -4,29 +4,62 @@
 # This is a silly little tool for chatting with NodeMCU.
 
 import argparse
+import os.path
 import serial
 import socket
 import socketserver
+import sys
 import time
 import threading
 
-DEBUG = True
+DEBUG = False
 
 BAUDRATE = 9600
 DEFAULT_PORT = 9600  # lol why not
 BROADCAST_PORT = 5050
 
-class SerialConn:
-    # TODO: timeouts
+
+class ESPConn:
+    """ Abstract base class representing a connection to an ESP"""
+    def readuntil(self, delim):
+        """ Read until a delimiter is seen"""
+        buf = self.read(1)
+        while not buf.endswith(delim):
+            buf += self.read(1)
+        return buf
+
+    def do_command(self, command):
+        self.write(command + self.newline)
+        response = self.readuntil(self.newline + b'> ')
+        if DEBUG:
+            print ("Got response: " + response.decode('ascii'))
+        responses = response.split(self.newline)
+
+        # telnet mode has no echo, serial does
+        # snarf the echoed command from serial
+        if self.consume_echo and len(responses) > 0:
+            responses = responses[1:]
+
+        if len(responses) > 0:
+            return responses[:-1]
+
+
+class SerialConn(ESPConn):
+    r""" Handle a serial connection to an ESP
+    This uses \r\n as the EOL marker, and uses remote echo
+    """
     def __init__(self, port):
         self.port = serial.Serial(port, BAUDRATE)
 
+        self.newline = b'\r\n'
+        self.consume_echo = True
+
         if DEBUG:
-            print("Flusing serial port")
-        self.write(b'\r\n')  # flush whatever state the repl is in
+            print("Flushing serial port")
+        self.write(self.newline)  # flush whatever state the repl is in
 
         self.port.timeout = 2
-        print(self.port.read(100))
+        self.port.read(100)
 
         self.port.timeout = 10
 
@@ -38,34 +71,44 @@ class SerialConn:
     def read(self, length):
         return self.port.read(length)
 
-    def readuntil(self, delim=b"\r\n> "):
-        """ Read until a delimiter is seen"""
-        buf = self.read(1)
-        while not buf.endswith(delim):
-            buf += self.read(1)
-        print(buf)
-        return buf
 
-    def do_command(self, command):
-        self.write(command + b"\r\n")
-        response = self.readuntil()
-        if DEBUG:
-            print ("Got response: " + response.decode('ascii'))
-        responses = response.split(b'\r\n')
+class TelnetConn(ESPConn):
+    r""" Represents a telnet connection to an ESP
+    This uses \n as the EOL marker and does not have remote echo
+    """
 
-        # The first response is the command we sent, the last response is
-        # the newline, so if there is a middle one then return that
-        if len(responses) > 2:
-            return responses[1:-1]
+    def __init__(self, ip, port):
+        self.newline = b'\n'
+        self.consume_echo = False
+
+        self.sock = socket.create_connection((ip, port))
+        self.sock.settimeout(2)
+
+        self.sock.send(self.newline)
+        self.readuntil(self.newline + b'> ')
+
+    def write(self, buf):
+        self.sock.sendall(buf)
+
+    def read(self, length):
+        return self.sock.recv(length)
 
 
 class FileServer:
+    """ Open up a port that, upon connection, spits out the contents
+    of a file, then immediately closes
+
+    Essentially equivalent to nc -l -p 9600 < path_to_file
+    """
+
     def __init__(self, filepath, port=DEFAULT_PORT):
         self.filepath = filepath
         self.port = port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind(('0.0.0.0', port))
         self.socket.listen(1)
+
+        self.event = threading.Event()
 
     def serve(self):
         self.thread = threading.Thread(target=self._serve, daemon=False)
@@ -77,14 +120,12 @@ class FileServer:
     def _serve(self):
         """ Called by thread"""
         conn, addr = self.socket.accept()
-        print("Got connection, serving file")
 
         # be lazy, read the whole file in to memory
         contents = open(self.filepath, 'rb').read()
         conn.sendall(contents)
         conn.close()
-        print("File sent")
-        self.stop()
+        self.event.set()
 
 
 class BroadcastListener(socketserver.BaseRequestHandler):
@@ -93,12 +134,29 @@ class BroadcastListener(socketserver.BaseRequestHandler):
     """
     def handle(self):
         data = self.request[0].strip()
+        fields = data.split(b' ')
+
+        if len(fields) != 3:
+            print("Got invalid data (a)! [{}]".format(data))
+            return
+
+        if fields[0] != b'PING!':
+            print ("Got invalid data (b)! [{}]".format(data))
+            return
+
         ip = self.client_address[0]
-        print("Got a ping from {}: [{}]!".format(ip, data))
+        chipid = fields[2]
+
+        self.server.ping_callback(ip, chipid)
 
 
 def main():
     args = parse_args()
+
+    if args.debug:
+        global DEBUG
+        DEBUG = True
+
     command = args.op
     if command == 'wifi':
         setup_wifi(args.port[0],
@@ -108,7 +166,11 @@ def main():
         bootstrap(args.port[0])
 
     elif command == 'watch':
-        watch()
+        ping_watch()
+
+    elif command == 'send':
+        send_file(args.src, args.dst, args.ip, args.chip_id)
+
 
 def setup_wifi(port, ssid, password):
     """Issue the serial commands to set up wifi"""
@@ -140,17 +202,25 @@ def bootstrap(port):
 
     if res[-1] != b'OK':
         print("Command failed!")
+        print(res)
         return False
 
     # Start the fileserver
-    serve_file('lua/init-tiny.lua')
+    print("Starting fileserver")
+    basedir = os.path.dirname(sys.argv[0])
+    init_path = os.path.join(basedir, 'lua', 'init.lua')
+    fs = FileServer(init_path)
+    fs.serve()
 
-    ip = socket.gethostbyname(socket.gethostname())
+    local_ip = socket.gethostbyname(socket.gethostname())
     res = sp.do_command(bytes(
-        'ip="{}"; filename="init.lua"; print("OK")'.format(ip), 'ascii'))
+        'ip="{}"; filename="init.lua"; print("OK")'.format(local_ip), 'ascii'))
     if res[0] != b'OK':
         print("Command failed!")
+        print(res)
         return False
+
+    print("Downloading file")
 
     bootstrap_cmd = b'sk = net.createConnection(net.TCP, 0); ' + \
         b'file.open(filename, "w+"); ' + \
@@ -158,38 +228,72 @@ def bootstrap(port):
         b'sk:on("disconnection", function(sock, a) file.flush(); file.close(); end); ' + \
         b'sk:connect(' + bytes(str(DEFAULT_PORT), 'ascii') + b', ip); ' + \
         b'print("OK")'
-
     res = sp.do_command(bootstrap_cmd)
+
     if res[0] != b'OK':
-        print("Command failed!")
+        fs.stop()
+        print("Command failed")
+        print(res)
         return False
 
-    time.sleep(4)
-
-    res = sp.do_command(b'node.compile("init.lua"); print("OK")')
-    if res[0] != b'OK':
-        print("Compiling init.lua failed, bad!")
-        sp.do_command(b'file.remove("init.lua")')
-        return False
+    fs.event.wait()  # Wait for the server to say that it's done
+    fs.stop()
 
     res = sp.do_command(b'print(node.chipid())')
     chipid = res[0]
-    print ("Bootstrap of chip {} successful! ".format(chipid) +
-           "Run mcutool shell, then reboot module, to connect")
+    print ("Bootstrap of chip {} successful! ".format(chipid.decode('ascii')) +
+           "Run mcutool watch, then reboot module, to connect")
     return True
 
 
-def serve_file(path):
-    """ Open a socket that will serve a file """
-    fs = FileServer(path)
-    fs.serve()
+def _print_ping(ip, chipid):
+    print("Ping!\tip: {}\tchipid: {}".format(ip, chipid.decode('ascii')))
 
 
-def send_file():
-    """ Wait for a booting ESP to connect, then drop in to a shell """
+def ping_watch(cb=_print_ping):
+    """ Watch for the boot pings.
+    Args:
+        target - the chipid to watch for. if none, select all
+        cb: function to call when there's a hit
+    """
     server = socketserver.UDPServer(('0.0.0.0', BROADCAST_PORT),
                                     BroadcastListener)
+    server.ping_callback = cb
     server.serve_forever()
+
+
+def send_file(src, dst, target_ip=None, target_chipid=None):
+    """ Wait for a booting ESP to connect, then telnet in and send
+    a file """
+
+    def send_cb(ip, chipid):
+        if target_chipid and chipid != bytes(target_chipid, 'ascii'):
+            return
+
+        # Open up the serving socket.
+        fs = FileServer(src)
+        fs.serve()
+
+        local_ip = socket.gethostbyname(socket.gethostname())
+        conn = TelnetConn(ip, 2323)
+        res = conn.do_command(
+            b'getfile("' + bytes(local_ip, "ascii") + b'", "' +
+            bytes(dst, "ascii") +
+            b'"); print("OK")')
+
+        if res[0] != b'OK':
+            print("Something failed")
+            print(res)
+
+        fs.event.wait()
+        print("File successfully uploaded")
+
+        fs.stop()
+
+    if target_ip:
+        send_cb(target_ip, None)
+    else:
+        ping_watch(send_cb)
 
 
 def escape_lua(instr):
@@ -206,6 +310,9 @@ def escape_lua(instr):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Make NodeMCU a little kinder")
+
+    parser.add_argument('--debug', '-d', default=False, action='store_true',
+                        help="Be verbose about things")
 
     subparsers = parser.add_subparsers(
         dest='op')
@@ -233,12 +340,16 @@ def parse_args():
         'send', help="Send a file to a given target. If no target is " +
         "specified, send it to the next board that boots")
 
-    parser_send.add_argument('--ip', nargs=1,
+    parser_send.add_argument('--ip', action='store',
                              help="The IP to connect to")
 
-    parser_send.add_argument('--chip-id', nargs=1, metavar="CHIPID",
+    parser_send.add_argument('--chip-id', action='store', metavar="CHIPID",
                              help="Wait for CHIPID to send a broadcast, then " +
                              "connect to that")
+
+    parser_send.add_argument('src', help="The file on disk to send")
+
+    parser_send.add_argument('dst', help="The destination filename on the ESP")
 
     args = parser.parse_args()
 
